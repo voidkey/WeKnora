@@ -94,9 +94,17 @@
                                     class="menu-pending-badge"
                                     :title="t('organization.settings.pendingJoinRequestsBadge')">{{
                                         orgStore.totalPendingJoinRequestCount }}</span>
-                                <span v-if="item.path === 'creatChat' && batchMode" class="batch-cancel-hint"
-                                    @click.stop="exitBatchMode">{{ t('batchManage.cancel') }}</span>
-                                <t-icon v-else-if="item.path === 'creatChat'" name="add" class="menu-create-hint" />
+                                <!-- 「对话」标题行右侧控件组:来源切换图标 + 新建 -->
+                                <span v-if="item.path === 'creatChat'" class="menu-trailing">
+                                    <SourceSwitcherDropdown v-if="showSourceFilter && !batchMode"
+                                        :sources="sourceOptions" :current="currentSource" @select="switchSource">
+                                        <t-icon name="filter" @click.stop :title="currentSourceLabel"
+                                            :class="['menu-source-icon', { 'menu-source-icon-active': currentSource !== DEFAULT_SESSION_SOURCE }]" />
+                                    </SourceSwitcherDropdown>
+                                    <span v-if="batchMode" class="batch-cancel-hint"
+                                        @click.stop="exitBatchMode">{{ t('batchManage.cancel') }}</span>
+                                    <t-icon v-else name="add" class="menu-create-hint" />
+                                </span>
                             </template>
                         </div>
                     </div>
@@ -140,6 +148,10 @@
                             </div>
                         </div>
                     </template>
+                    <!-- 空状态：加载完成且当前来源无会话（切到无会话来源时不再白屏） -->
+                    <div v-if="!loading && groupedSessions.length === 0" class="submenu_empty">
+                        {{ t('menu.noSessions') }}
+                    </div>
                 </div>
                 <div v-if="batchMode && item.path === 'creatChat' && !uiStore.sidebarCollapsed"
                     class="batch-inline-footer">
@@ -172,6 +184,15 @@ import { onMounted, watch, computed, ref, h } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { getSessionsList, delSession, batchDelSessions, deleteAllSessions, clearSessionMessages, pinSession, unpinSession } from "@/api/chat/index";
 import { useChatResourcesStore } from '@/stores/chatResources';
+import { listAllIMChannels } from '@/api/agent/index';
+import SourceSwitcherDropdown from './SourceSwitcherDropdown.vue';
+import {
+    DEFAULT_SESSION_SOURCE,
+    buildSourceOptions,
+    configuredPlatforms,
+    shouldShowSourceFilter,
+    type SessionSource,
+} from './sessionSourceFilter';
 import { logout as logoutApi } from '@/api/auth';
 import { useMenuStore } from '@/stores/menu';
 import { useAuthStore } from '@/stores/auth';
@@ -225,8 +246,25 @@ const currentpath = ref('');
 const currentPage = ref(1);
 const page_size = ref(30);
 const total = ref(0);
+// Monotonic token to discard stale list responses when loads race (see getMessageList).
+let listRequestToken = 0;
 const currentSecondpath = ref('');
 const submenuscrollContainer = ref(null);
+// Default to the user's own web chats; only tenants with a configured IM
+// channel get the switcher to reach a platform's sessions.
+const currentSource = ref<SessionSource>(DEFAULT_SESSION_SOURCE);
+const imPlatforms = ref<string[]>([]);
+const showSourceFilter = computed(() => shouldShowSourceFilter(imPlatforms.value));
+// Options for the source switcher: web first, then each configured IM platform.
+// Logos are resolved here (where platformLogo lives) so the dropdown stays dumb.
+const sourceOptions = computed(() =>
+    buildSourceOptions(imPlatforms.value, t('menu.myChats'), (p) => t(`agentEditor.im.${p}`))
+        .map((o) => ({ ...o, logo: o.platform ? platformLogo(o.platform) : '' }))
+);
+// Full label of the active source, shown as the trigger icon's tooltip.
+const currentSourceLabel = computed(() =>
+    sourceOptions.value.find((o) => o.value === currentSource.value)?.label ?? t('menu.myChats')
+);
 // 计算总页数
 const totalPages = computed(() => Math.ceil(total.value / page_size.value));
 const hasMore = computed(() => currentPage.value < totalPages.value);
@@ -638,8 +676,10 @@ const checkScrollBottom = () => {
 }
 const handleScroll = debounce(checkScrollBottom, 200)
 const getMessageList = async (isLoadMore = false) => {
-    if (loading.value) return Promise.resolve();
-    loading.value = true;
+    // Scroll-driven load-more must never stack. A fresh load (first load, route
+    // change, or source switch) instead supersedes any in-flight request via the
+    // token below, so it is allowed through even while one is still running.
+    if (isLoadMore && loading.value) return Promise.resolve();
 
     // 只有在首次加载或路由变化时才清空数组，滚动加载时不清空
     if (!isLoadMore) {
@@ -647,9 +687,16 @@ const getMessageList = async (isLoadMore = false) => {
         usemenuStore.clearMenuArr();
     }
 
-    return getSessionsList(currentPage.value, page_size.value).then((res: any) => {
+    // Snapshot the source and claim a request token: when loads race, only the
+    // newest may mutate the list, so a slow earlier response can't append rows
+    // to the wrong source or revive a list the user has already switched away from.
+    const requestSource = currentSource.value;
+    const token = ++listRequestToken;
+    loading.value = true;
+
+    return getSessionsList(currentPage.value, page_size.value, requestSource).then((res: any) => {
+        if (token !== listRequestToken) return; // superseded by a newer load
         if (res.data && res.data.length) {
-            // Display all sessions globally without filtering
             res.data.forEach((item: any) => {
                 let obj = {
                     title: item.title ? item.title : t('menu.newSession'),
@@ -666,11 +713,14 @@ const getMessageList = async (isLoadMore = false) => {
                 usemenuStore.updatemenuArr(obj)
             });
         }
-        if ((res as any).total) {
-            total.value = (res as any).total;
+        // Use != null so an empty source (total === 0) correctly clears the count
+        // instead of leaving the previous source's total behind.
+        if (res && res.total != null) {
+            total.value = res.total;
         }
         loading.value = false;
     }).catch(() => {
+        if (token !== listRequestToken) return; // a newer load now owns `loading`
         loading.value = false;
     })
 }
@@ -689,6 +739,27 @@ async function loadCurrentKbInfo(kbId: string) {
         currentKbInfo.value = null
     }
 }
+
+// Switch the session source filter. getMessageList(false) resets pagination and
+// clears the list itself, and its request token makes any in-flight load for the
+// previous source a no-op, so the switch always lands on the chosen source.
+const switchSource = (source: SessionSource) => {
+    if (source === currentSource.value) return;
+    currentSource.value = source;
+    getMessageList();
+};
+
+// Detect whether this tenant has any IM channel configured. The filter control
+// is only shown when it does, so non-IM users see an unchanged sidebar. Failures
+// (e.g. no permission) silently leave the filter hidden.
+const loadImPlatforms = async () => {
+    try {
+        const res: any = await listAllIMChannels();
+        imPlatforms.value = configuredPlatforms(res?.data || []);
+    } catch {
+        imPlatforms.value = [];
+    }
+};
 
 onMounted(async () => {
     const routeName = typeof route.name === 'string' ? route.name : (route.name ? String(route.name) : '')
@@ -709,6 +780,8 @@ onMounted(async () => {
 
     // 加载对话列表
     getMessageList();
+    // 检测当前租户是否配置了 IM 渠道，决定是否显示来源筛选
+    loadImPlatforms();
     // 若组织列表未加载则拉取一次，用于侧栏「待审批」角标
     if (orgStore.organizations.length === 0) {
         orgStore.fetchOrganizations();
@@ -1334,7 +1407,6 @@ const onDragHandleMouseDown = (e: MouseEvent) => {
 }
 
 .batch-cancel-hint {
-    margin-left: auto;
     margin-right: 8px;
     font-size: 13px;
     color: var(--td-text-color-disabled);
@@ -1448,7 +1520,6 @@ const onDragHandleMouseDown = (e: MouseEvent) => {
 }
 
 .menu-create-hint {
-    margin-left: auto;
     margin-right: 6px;
     font-size: 15px;
     color: var(--td-brand-color);
@@ -1459,6 +1530,44 @@ const onDragHandleMouseDown = (e: MouseEvent) => {
 
 .menu_item:hover .menu-create-hint {
     opacity: 1;
+}
+
+/* Owns the single margin-left:auto so the source-switch icon and the "+" stay
+   grouped on the right (two auto-margins would split the gap and scatter them). */
+.menu-trailing {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+/* Source switcher icon: muted by default, brand-coloured when a non-web source is active. */
+.menu-source-icon {
+    font-size: 15px;
+    color: var(--td-text-color-placeholder);
+    opacity: 0.7;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: opacity 0.2s ease, color 0.2s ease;
+}
+
+.menu_item:hover .menu-source-icon {
+    opacity: 1;
+}
+
+.menu-source-icon-active {
+    color: var(--td-brand-color);
+    opacity: 1;
+}
+
+/* Empty state when the active source has no sessions. */
+.submenu_empty {
+    padding: 24px 14px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+    user-select: none;
 }
 
 // 顶部 logo_row 右侧的图标按钮组（搜索 + 折叠），与折叠按钮风格一致
